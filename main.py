@@ -242,6 +242,10 @@ class Analysis:
         self.you = you if isinstance(you, dict) else {}
         self.seat = self.you.get("seat")
         self.role = self.you.get("role")
+        # v3 gating: only the seer uses the v2 claim-credibility model.  Wolf,
+        # doctor and villager keep v1's analysis, which the dev data shows is
+        # better for those seats.
+        self.claim_model_v2 = self.role == "seer"
         self.alive = bool(self.you.get("alive"))
         partner = self.you.get("partner")
         self.partner = partner if isinstance(partner, dict) else None
@@ -382,16 +386,15 @@ class Analysis:
 
     def _record_result(self, speaker, day, target, is_wolf, clause, round_no, speech_index):
         night = self._night_number(clause)
-        # Repeating the same inspection in both debate rounds is not new
-        # evidence, and it must not double the seer's apparent credibility or
-        # the target's suspicion.
-        for existing in self.results:
-            if (
-                existing.get("speaker") == speaker
-                and existing.get("target") == target
-                and bool(existing.get("werewolf")) == bool(is_wolf)
-            ):
-                return
+        # v2 dedupe is seer-only.  Non-seer seats keep v1's full result list.
+        if self.claim_model_v2:
+            for existing in self.results:
+                if (
+                    existing.get("speaker") == speaker
+                    and existing.get("target") == target
+                    and bool(existing.get("werewolf")) == bool(is_wolf)
+                ):
+                    return
         self.results.append(
             {
                 "speaker": speaker,
@@ -673,34 +676,52 @@ class Analysis:
                 credibility[seat] = -100.0
                 continue
             value = 1.0
-            # A player repeating the same claim in both debate rounds is not
-            # new evidence.  Count each unique night/target/verdict once.
-            unique_results = {}
-            for result in self.results:
-                if result.get("speaker") != seat:
-                    continue
-                key = (
-                    result.get("target"),
-                    bool(result.get("werewolf")),
-                )
-                unique_results[key] = result
-            for result in unique_results.values():
-                target = result.get("target")
-                if target in self.dead_roles:
-                    actual_wolf = self.dead_roles[target] == "werewolf"
-                    if result.get("werewolf") and actual_wolf:
-                        value += 2.0
-                    elif result.get("werewolf") and not actual_wolf:
-                        value -= 3.0
-                    elif not result.get("werewolf") and actual_wolf:
-                        value -= 3.0
+            if self.claim_model_v2:
+                # A player repeating the same claim in both debate rounds is
+                # not new evidence.  Count each unique target/verdict once.
+                unique_results = {}
+                for result in self.results:
+                    if result.get("speaker") != seat:
+                        continue
+                    key = (
+                        result.get("target"),
+                        bool(result.get("werewolf")),
+                    )
+                    unique_results[key] = result
+                for result in unique_results.values():
+                    target = result.get("target")
+                    if target in self.dead_roles:
+                        actual_wolf = self.dead_roles[target] == "werewolf"
+                        if result.get("werewolf") and actual_wolf:
+                            value += 2.0
+                        elif result.get("werewolf") and not actual_wolf:
+                            value -= 3.0
+                        elif not result.get("werewolf") and actual_wolf:
+                            value -= 3.0
+                        else:
+                            # A wolf can truthfully clear a villager too, so
+                            # only a confirmed wolf hit is proof.
+                            value += 0.0
                     else:
-                        # A wolf can truthfully "clear" a villager too, so a
-                        # confirmed village clear authenticates nothing.  Only
-                        # a confirmed wolf hit (or a clear on a wolf) is proof.
-                        value += 0.0
-                else:
-                    value += 0.2
+                        value += 0.2
+            else:
+                # v1 scoring for wolf, doctor and villager.
+                for result in self.results:
+                    if result.get("speaker") != seat:
+                        continue
+                    target = result.get("target")
+                    if target in self.dead_roles:
+                        actual_wolf = self.dead_roles[target] == "werewolf"
+                        if result.get("werewolf") and actual_wolf:
+                            value += 2.0
+                        elif result.get("werewolf") and not actual_wolf:
+                            value -= 3.0
+                        elif not result.get("werewolf") and actual_wolf:
+                            value -= 3.0
+                        else:
+                            value += 1.0
+                    else:
+                        value += 0.3
             for accusation in self.accusations:
                 if accusation.get("speaker") != seat:
                     continue
@@ -829,9 +850,11 @@ class Analysis:
         claims = self.credible_seer_claims()
         if not claims:
             return None
-        # Credibility only decides when it is clearly better.  Two players
-        # with near-identical stories are separated by who took the floor
-        # first, not by seat number.
+        if not self.claim_model_v2:
+            # v1 tie-break for wolf, doctor and villager.
+            return max(claims, key=lambda seat: (claims[seat], -seat))
+        # v2: credibility only decides when it is clearly better.  Two
+        # near-identical stories are separated by who took the floor first.
         top = max(claims.values())
         contenders = [seat for seat, value in claims.items() if value >= top - 0.25]
 
