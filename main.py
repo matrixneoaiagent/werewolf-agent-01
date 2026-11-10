@@ -381,11 +381,22 @@ class Analysis:
         return min(mentions, key=lambda seat: (abs(mentions[seat] - anchor), mentions[seat]))
 
     def _record_result(self, speaker, day, target, is_wolf, clause, round_no, speech_index):
+        night = self._night_number(clause)
+        # Repeating the same inspection in both debate rounds is not new
+        # evidence, and it must not double the seer's apparent credibility or
+        # the target's suspicion.
+        for existing in self.results:
+            if (
+                existing.get("speaker") == speaker
+                and existing.get("target") == target
+                and bool(existing.get("werewolf")) == bool(is_wolf)
+            ):
+                return
         self.results.append(
             {
                 "speaker": speaker,
                 "day": day,
-                "night": self._night_number(clause),
+                "night": night,
                 "target": target,
                 "werewolf": bool(is_wolf),
                 "explicit": True,
@@ -662,9 +673,18 @@ class Analysis:
                 credibility[seat] = -100.0
                 continue
             value = 1.0
+            # A player repeating the same claim in both debate rounds is not
+            # new evidence.  Count each unique night/target/verdict once.
+            unique_results = {}
             for result in self.results:
                 if result.get("speaker") != seat:
                     continue
+                key = (
+                    result.get("target"),
+                    bool(result.get("werewolf")),
+                )
+                unique_results[key] = result
+            for result in unique_results.values():
                 target = result.get("target")
                 if target in self.dead_roles:
                     actual_wolf = self.dead_roles[target] == "werewolf"
@@ -675,9 +695,12 @@ class Analysis:
                     elif not result.get("werewolf") and actual_wolf:
                         value -= 3.0
                     else:
-                        value += 1.0
+                        # A wolf can truthfully "clear" a villager too, so a
+                        # confirmed village clear authenticates nothing.  Only
+                        # a confirmed wolf hit (or a clear on a wolf) is proof.
+                        value += 0.0
                 else:
-                    value += 0.3
+                    value += 0.2
             for accusation in self.accusations:
                 if accusation.get("speaker") != seat:
                     continue
@@ -806,7 +829,17 @@ class Analysis:
         claims = self.credible_seer_claims()
         if not claims:
             return None
-        return max(claims, key=lambda seat: (claims[seat], -seat))
+        # Credibility only decides when it is clearly better.  Two players
+        # with near-identical stories are separated by who took the floor
+        # first, not by seat number.
+        top = max(claims.values())
+        contenders = [seat for seat, value in claims.items() if value >= top - 0.25]
+
+        def key(seat):
+            index = self._first_seer_claim_index(seat)
+            return (-(index if index is not None else 10**9), -seat)
+
+        return max(contenders, key=key)
 
     def dead_seer_revealed(self):
         return any(role == "seer" for role in self.dead_roles.values())
@@ -1558,14 +1591,18 @@ class Agent:
         # it is not a wolf read: claim the role, share the clear, and leave the
         # vote to the table rather than leading a mis-exile.
         if not wolf_targets and not impostors and pressure < 2.0 and analysis.day < 2:
-            parts = ["I'm the seer."]
+            # Take the seer floor before a wolf can.  Share the clear, ask the
+            # doctor for cover, and warn off a counterclaim, but do not invent
+            # a wolf read or push a social suspect.
+            parts = ["I'm the seer.", "Doctor, please protect me tonight."]
             for night, target, is_wolf in results:
                 if target in analysis.names:
                     parts.append(
                         "Night %s: %s is not a wolf."
                         % (str(night) if night else "last night", analysis.names[target])
                     )
-            parts.append("I don't have a wolf yet; I'll follow the table.")
+            parts.append("Anyone who counterclaims me is the wolf.")
+            parts.append("I don't have a wolf yet; I'll vote with the table.")
             meta_results = [
                 (night if isinstance(night, int) else 0, target, is_wolf)
                 for night, target, is_wolf in results
@@ -1584,9 +1621,12 @@ class Agent:
                 ),
             )
         else:
-            push = self._push_village(game, analysis, known_wolves, known_good, memory)
+            # With only clears there is no wolf to push.  Naming a social
+            # suspect under seer authority too often turns a clear claim into
+            # a mis-exile; leave the vote to the table and keep the clears.
+            push = None
 
-        parts = ["I'm the seer."]
+        parts = ["I'm the seer.", "Doctor, please protect me tonight."]
         if analysis.day >= 2 and memory.claim != "seer":
             parts.append("I stayed quiet to survive.")
         shown = [result for result in results if result[2]]
@@ -1602,6 +1642,9 @@ class Agent:
                     "is a werewolf" if is_wolf else "is not a wolf",
                 )
             )
+        if not wolf_targets and not impostors:
+            parts.append("Anyone who counterclaims me is the wolf.")
+            parts.append("I have no wolf yet; I'll vote with the table.")
         if wolf_targets:
             parts.append("That is a confirmed werewolf.")
         elif push is not None:
@@ -2066,24 +2109,81 @@ class Agent:
             available = [seat for seat in candidates if seat not in known_good]
         if not available:
             available = candidates
-        suspicion = analysis.suspicion_scores()
         public = analysis.suspicion_scores(public=True)
+        impostors = [
+            seat for seat in analysis.claimed_seers(alive_only=True) if seat != analysis.seat
+        ]
 
         def score(seat):
-            value = 0.6 * suspicion.get(seat, 0) + 0.4 * public.get(seat, 0)
+            value = 0.0
+            # A rival seer claim is a direct role conflict.  Inspecting the
+            # claimant resolves whether the village is being led by a wolf.
+            if seat in impostors:
+                value += 60.0
+
+            # Active accusers drive the table.  A wolf usually has to accuse
+            # villagers; weak/generic accusations and pushes on cleared players
+            # are especially telling.
+            made = [
+                accusation
+                for accusation in analysis.accusations
+                if accusation.get("speaker") == seat
+            ]
+            value += 3.0 * len(made)
+            for accusation in made:
+                if accusation.get("weak"):
+                    value += 3.0
+                target = accusation.get("target")
+                if target in known_good:
+                    value += 10.0
+                if target in analysis.dead_roles and analysis.dead_roles.get(target) in (
+                    "villager",
+                    "doctor",
+                    "seer",
+                ):
+                    value += 6.0
+
+            # Defending a revealed wolf or a wolf we already found is a strong
+            # partner tell.
+            for clear in analysis.clears:
+                if clear.get("speaker") != seat:
+                    continue
+                target = clear.get("target")
+                if target in analysis.dead_roles and analysis.dead_roles.get(target) == "werewolf":
+                    value += 35.0
+                if target in known_wolves:
+                    value += 35.0
+
+            # Votes for revealed villagers or cleared players are suspicious.
+            for vote in analysis.votes:
+                if vote.get("seat") != seat or vote.get("target") is None:
+                    continue
+                target = vote["target"]
+                if target in analysis.dead_roles and analysis.dead_roles.get(target) in (
+                    "villager",
+                    "doctor",
+                    "seer",
+                ):
+                    value += 10.0
+                if target in known_good:
+                    value += 10.0
+
+            # Association with a wolf we already found.
             for wolf in known_wolves:
                 for clear in analysis.clears:
                     if clear.get("speaker") == wolf and clear.get("target") == seat:
-                        value += 20.0
+                        value += 25.0
                     if clear.get("speaker") == seat and clear.get("target") == wolf:
-                        value += 20.0
+                        value += 25.0
                 for accusation in analysis.accusations:
                     if accusation.get("speaker") == wolf and accusation.get("target") == seat:
-                        value -= 8.0
+                        value -= 10.0
                     if accusation.get("speaker") == seat and accusation.get("target") == wolf:
-                        value -= 8.0
-            if seat in inspected:
-                value -= 100.0
+                        value -= 10.0
+
+            value += 0.2 * public.get(seat, 0)
+            if not analysis.speeches_by(seat):
+                value -= 5.0
             return value
 
         return min(
